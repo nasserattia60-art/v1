@@ -1,0 +1,4 @@
+requests
+beautifulsoup4
+edge-tts
+moviepy  # optional - only needed if you use video.py's --engine moviepy

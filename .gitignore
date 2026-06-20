@@ -1,3 +1,7 @@
-/.venv
+.venv/
+__pycache__/
+*.pyc
+quotes.csv
 quotes_pandas.csv
+output/
 *.mp3

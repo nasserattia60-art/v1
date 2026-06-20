@@ -1,267 +1,174 @@
+"""
+End-to-end pipeline: pick the next unused quote from the CSV, narrate it
+with TTS, lay the narration over a background video, then mark the quote
+as used so it isn't processed again.
+"""
+from __future__ import annotations
+
+import argparse
 import asyncio
 import csv
+import logging
 import os
-import subprocess
 from datetime import datetime
-import edge_tts
+from typing import Optional
 
-# الإعدادات الافتراضية
-CSV_FILE = "quotes_pandas.csv"
+from tts import text_to_speech, DEFAULT_VOICE, DEFAULT_RATE, DEFAULT_PITCH
+from video import merge_audio_video_ffmpeg
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+CSV_FILE = "quotes.csv"
 VIDEO_BG = "background.mp4"
 OUTPUT_DIR = "output"
-
-# ضبط النبرة والسرعة (لصوت ناضج هاديء)
-RATE = "-20%"
-PITCH = "-10Hz"
-VOICE = "ar-SA-HamedNeural"
+FIELDNAMES = ["id", "quote", "author", "used", "date"]
 
 
-# ------- دوال CSV -------
+# ------- CSV helpers -------
 
-def get_next_quote(csv_file: str = CSV_FILE):
-    """
-    يقرأ CSV ويجيب أول اقتباس لم يستخدم بعد (used=False)
-    
-    Parameters:
-        csv_file (str): مسار ملف CSV
-    
-    Returns:
-        tuple: (quote_dict, all_rows) أو (None, rows) إذا لم يتبق اقتباس
-    """
-    rows = []
-    with open(csv_file, mode='r', encoding='utf-8-sig', newline='') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-    
-    for row in rows:
-        if row['used'].strip() == 'False':
-            return row, rows
-    
-    return None, rows
+def load_rows(csv_file: str) -> list[dict]:
+    with open(csv_file, mode="r", encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
 
 
-def mark_as_used(quote_id: str, rows: list, csv_file: str = CSV_FILE):
-    """
-    يحدث عمود used في CSV إلى True بعد معالجة الاقتباس
-    
-    Parameters:
-        quote_id (str): رقم الاقتباس
-        rows (list): قائمة بكل الصفوف من CSV
-        csv_file (str): مسار ملف CSV
-    """
-    for row in rows:
-        if row['id'] == quote_id:
-            row['used'] = 'True'
-            row['date'] = datetime.now().isoformat()
-            break
-    
-    with open(csv_file, mode='w', encoding='utf-8-sig', newline='') as f:
-        fieldnames = ['id', 'الحكمة', 'الكاتب', 'used', 'date']
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+def save_rows(csv_file: str, rows: list[dict]) -> None:
+    with open(csv_file, mode="w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
 
 
-# ------- دوال الصوت -------
-
-async def text_to_speech(
-    text: str,
-    output_audio: str,
-    voice: str = VOICE,
-    rate: str = RATE,
-    pitch: str = PITCH
-):
-    """
-    يحول النص إلى ملف صوت mp3 باستخدام edge-tts
-    
-    Parameters:
-        text (str): النص المراد تحويله
-        output_audio (str): مسار ملف الصوت الناتج
-        voice (str): اسم الصوت
-        rate (str): سرعة الكلام
-        pitch (str): نبرة الصوت
-    """
-    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-    await communicate.save(output_audio)
-    print(f"  ✅ تم إنشاء الملف الصوتي: {output_audio}")
+def get_next_quote(csv_file: str = CSV_FILE) -> tuple[Optional[dict], list[dict]]:
+    """Return (first unused row, all rows), or (None, rows) if none are left."""
+    rows = load_rows(csv_file)
+    for row in rows:
+        if row.get("used", "False").strip() != "True":
+            return row, rows
+    return None, rows
 
 
-# ------- دوال الفيديو -------
+def mark_as_used(quote_id: str, rows: list[dict], csv_file: str = CSV_FILE) -> None:
+    """Flip a row's `used` flag and stamp the processing date, then rewrite the CSV."""
+    for row in rows:
+        if row["id"] == quote_id:
+            row["used"] = "True"
+            row["date"] = datetime.now().isoformat()
+            break
+    save_rows(csv_file, rows)
 
-def merge_audio_to_video(audio_file: str, video_bg: str, output_video: str):
-    """
-    يدمج الصوت مع فيديو الخلفية وينتج فيديو نهائي
-    
-    Parameters:
-        audio_file (str): مسار ملف الصوت
-        video_bg (str): مسار فيديو الخلفية
-        output_video (str): مسار الفيديو الناتج
-    
-    Returns:
-        bool: True إذا نجح الدمج، False إذا فشل
-    """
-    cmd = [
-        'ffmpeg', '-y',
-        '-i', video_bg,
-        '-i', audio_file,
-        '-c:v', 'libx264',
-        '-c:a', 'aac',
-        '-shortest',
-        '-map', '0:v:0',
-        '-map', '1:a:0',
-        output_video
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-        print(f"  ✅ تم إنشاء الفيديو النهائي: {output_video}")
-        return True
-    else:
-        print(f"  ❌ فشل دمج الفيديو: {result.stderr}")
-        return False
 
+# ------- Processing -------
 
 async def process_quote(
     quote_id: str,
     quote_text: str,
     author: str,
     output_dir: str = OUTPUT_DIR,
-    video_bg: str = VIDEO_BG
-):
-    """
-    يعالج اقتباس واحد: يحوله إلى صوت ثم يدمجه مع الفيديو
-    
-    Parameters:
-        quote_id (str): رقم الاقتباس
-        quote_text (str): نص الاقتباس
-        author (str): اسم الكاتب
-        output_dir (str): مجلد الإخراج
-        video_bg (str): مسار فيديو الخلفية
-    
+    video_bg: str = VIDEO_BG,
+) -> tuple[str, str]:
+    """Narrate one quote and merge the narration onto the background video.
+
     Returns:
-        tuple: (audio_file, video_file) مسارات الملفات الناتجة
+        (audio_file_path, video_file_path)
+
+    Raises:
+        RuntimeError: if the video merge step fails.
     """
     os.makedirs(output_dir, exist_ok=True)
-    
-    full_text = f"{quote_text}. قالها: {author}"
-    
+
+    full_text = f"{quote_text}. Said by: {author}"
     audio_file = os.path.join(output_dir, f"{quote_id}.mp3")
     video_file = os.path.join(output_dir, f"{quote_id}.mp4")
-    
-    print(f"\n--- جاري معالجة الاقتباس رقم {quote_id} ---")
-    print(f"النص: {quote_text}")
-    print(f"الكاتب: {author}")
-    
-    # 1. تحويل النص إلى صوت
-    print("  • جاري توليد الصوت...")
-    await text_to_speech(full_text, audio_file)
-    
-    # 2. دمج الصوت مع الفيديو
-    print("  • جاري دمج الصوت مع الفيديو...")
-    merge_audio_to_video(audio_file, video_bg, video_file)
-    
+
+    log.info("Processing quote #%s by %s", quote_id, author)
+    log.info("Text: %s", quote_text)
+
+    await text_to_speech(full_text, audio_file, DEFAULT_VOICE, DEFAULT_RATE, DEFAULT_PITCH)
+
+    if not merge_audio_video_ffmpeg(audio_file, video_bg, video_file):
+        raise RuntimeError(f"Video merge failed for quote #{quote_id}")
+
     return audio_file, video_file
 
 
 async def process_next_quote(
     csv_file: str = CSV_FILE,
     video_bg: str = VIDEO_BG,
-    output_dir: str = OUTPUT_DIR
-):
-    """
-    يجلب الاقتباس التالي غير المستخدم، يولّد صوتاً وفيديو، ويحدث CSV
-    
-    Parameters:
-        csv_file (str): مسار ملف CSV
-        video_bg (str): مسار فيديو الخلفية
-        output_dir (str): مجلد الإخراج
-    
+    output_dir: str = OUTPUT_DIR,
+) -> Optional[dict]:
+    """Process a single, next unused quote.
+
     Returns:
-        dict or None: معلومات الاقتباس المعالج، أو None إذا لم يتبق اقتباس
+        A dict describing the result, or None if there was nothing to do.
     """
-    # التأكد من وجود مجلد output
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # التأكد من وجود ملف الفيديو الأساسي
     if not os.path.exists(video_bg):
-        print(f"⚠  ملف الفيديو '{video_bg}' غير موجود. فضلاً أضف الفيديو في المجلد.")
+        log.warning("Background video '%s' not found — add it before running.", video_bg)
         return None
-    
-    # جلب الاقتباس التالي
+
+    if not os.path.exists(csv_file):
+        log.warning("CSV file '%s' not found — run the scraper first.", csv_file)
+        return None
+
     quote, all_rows = get_next_quote(csv_file)
-    
     if quote is None:
-        print("✅ تمت معالجة جميع الاقتباسات من قبل!")
+        log.info("All quotes have already been processed.")
         return None
-    
-    quote_id = quote['id']
-    quote_text = quote['الحكمة']
-    author = quote['الكاتب']
-    
-    # معالجة الاقتباس
-    audio_file, video_file = await process_quote(quote_id, quote_text, author, output_dir, video_bg)
-    
-    # تحديث CSV
+
+    quote_id = quote["id"]
+    audio_file, video_file = await process_quote(
+        quote_id, quote["quote"], quote["author"], output_dir, video_bg
+    )
     mark_as_used(quote_id, all_rows, csv_file)
-    
-    print(f"\n✅ تمت معالجة الاقتباس رقم {quote_id} بنجاح!")
-    print(f"  • ملف الصوت: {audio_file}")
-    print(f"  • ملف الفيديو: {video_file}")
-    
+
+    log.info("Quote #%s done -> %s", quote_id, video_file)
     return {
         "id": quote_id,
-        "text": quote_text,
-        "author": author,
+        "text": quote["quote"],
+        "author": quote["author"],
         "audio": audio_file,
-        "video": video_file
+        "video": video_file,
     }
 
 
 async def process_all_quotes(
     csv_file: str = CSV_FILE,
     video_bg: str = VIDEO_BG,
-    output_dir: str = OUTPUT_DIR
-):
-    """
-    يعالج جميع الاقتباسات غير المستخدمة بالتسلسل
-    
-    Parameters:
-        csv_file (str): مسار ملف CSV
-        video_bg (str): مسار فيديو الخلفية
-        output_dir (str): مجلد الإخراج
-    
-    Returns:
-        int: عدد الاقتباسات التي تمت معالجتها
-    """
+    output_dir: str = OUTPUT_DIR,
+) -> int:
+    """Process every unused quote in sequence. Returns how many were processed."""
     count = 0
     while True:
         result = await process_next_quote(csv_file, video_bg, output_dir)
         if result is None:
             break
         count += 1
-    
-    if count > 0:
-        print(f"\n🎉 تمت معالجة {count} اقتباس(ات) بنجاح!")
-    else:
-        print("لا توجد اقتباسات جديدة للمعالجة.")
-    
+
+    log.info("Processed %d quote(s) this run.", count)
     return count
 
 
-# ✅ أمثلة للاستخدام من ملف خارجي:
+# ✅ Example usage from another file:
 # import asyncio
-# from generate import process_next_quote, process_all_quotes
-# 
-# # لمعالجة اقتباس واحد فقط:
-# asyncio.run(process_next_quote())
-# 
-# # لمعالجة جميع الاقتباسات:
-# asyncio.run(process_all_quotes())
+# from pipeline import process_next_quote, process_all_quotes
 #
-# # لمعالجة باقي الاقتباسات دفعة واحدة:
-# asyncio.run(process_all_quotes(output_dir="output"))
+# asyncio.run(process_next_quote())          # process exactly one quote
+# asyncio.run(process_all_quotes())          # process every remaining quote
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Turn quotes into narrated videos.")
+    parser.add_argument("--csv", default=CSV_FILE)
+    parser.add_argument("--video", default=VIDEO_BG)
+    parser.add_argument("--output-dir", default=OUTPUT_DIR)
+    parser.add_argument("--all", action="store_true", help="Process every unused quote, not just one")
+    args = parser.parse_args()
+
+    if args.all:
+        asyncio.run(process_all_quotes(args.csv, args.video, args.output_dir))
+    else:
+        asyncio.run(process_next_quote(args.csv, args.video, args.output_dir))
 
 
 if __name__ == "__main__":
-    # للتشغيل المباشر: يعالج اقتباس واحد فقط
-    asyncio.run(process_next_quote())
+    main()

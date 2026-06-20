@@ -1,0 +1,68 @@
+# Quote Video Pipeline
+
+Scrapes Arabic wisdom quotes, narrates them with text-to-speech, and lays
+the narration over a background video to produce short quote videos.
+
+## Files
+
+| File             | Purpose                                                              |
+|------------------|-----------------------------------------------------------------------|
+| `scraper.py`     | Scrapes quotes from the source page into `quotes.csv` (was `scrap.py`) |
+| `tts.py`         | Text-to-speech helper using edge-tts (was `audio.py`)                |
+| `video.py`       | Merges an audio file onto a background video (was `vedu.py`)         |
+| `pipeline.py`    | Orchestrates: pick next quote → TTS → merge video → mark used (was `generate.py`) |
+| `migrate_csv.py` | One-time helper to convert an old `quotes_pandas.csv` into the new schema |
+
+## What was fixed / improved
+
+1. **Schema mismatch bug** — the old `scrap.py` wrote only two Arabic-named
+   columns (`الحكمة`, `الكاتب`), but `generate.py` expected `id`, `used`,
+   and `date` columns too. Running the original two scripts back-to-back
+   would have crashed on a `KeyError`. The new `scraper.py` writes the full
+   schema (`id, quote, author, used, date`) that `pipeline.py` consumes.
+2. **No error handling** — network calls, missing files, and subprocess
+   failures now raise/log clear errors instead of crashing with a raw
+   traceback or silently producing nothing.
+3. **Logging instead of `print`** — timestamped log lines make it easier
+   to tell what happened when running unattended (e.g. on a cron job).
+4. **Duplicate TTS code** — `audio.py` and `generate.py` each had their
+   own copy of `text_to_speech`. Consolidated into `tts.py`, imported by
+   `pipeline.py`.
+5. **`vedu.py` import bug** — `from moviepy.editor import ...` no longer
+   exists in moviepy 2.0+. `video.py` tries the new import path first and
+   falls back to the old one. The ffmpeg-based path (used by default) has
+   no moviepy dependency at all, so this only matters if you opt into the
+   `--engine moviepy` option.
+6. **CLI arguments** — every script now takes `argparse` flags
+   (`--csv`, `--url`, `--video`, `--all`, …) instead of hardcoded paths,
+   so you don't have to edit source to point at different files.
+7. **English throughout** — code, comments, and docstrings translated to
+   English. Quote *content* stays Arabic since that's the actual data.
+
+## Setup
+
+```bash
+pip install -r requirements.txt
+# ffmpeg must also be installed on your system (used directly via subprocess)
+```
+
+## Usage
+
+```bash
+# 1. Scrape new quotes into quotes.csv
+python scraper.py
+
+# 2. (Once, only if you have an old quotes_pandas.csv) migrate it:
+python migrate_csv.py quotes_pandas.csv quotes.csv
+
+# 3. Put your background clip next to the scripts as background.mp4
+
+# 4. Generate one video from the next unused quote
+python pipeline.py
+
+# ...or process every remaining quote in one go
+python pipeline.py --all
+```
+
+Generated audio/video files land in `output/`, named by quote id
+(e.g. `output/3.mp3`, `output/3.mp4`).
